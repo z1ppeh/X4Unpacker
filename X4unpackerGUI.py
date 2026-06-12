@@ -20,6 +20,7 @@ import re
 import subprocess
 import threading
 import shutil
+import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import queue
 import xml.etree.ElementTree as ET
@@ -84,7 +85,6 @@ class X4UnpackerGUI:
         self.root.geometry("1280x850")
         self.root.minimum_size = (1150, 750)
         
-        # Threading & Communication
         self.queue = queue.Queue()
         self.is_running = False
         self.cancel_event = threading.Event()
@@ -93,14 +93,11 @@ class X4UnpackerGUI:
         self.filtered_dlc_sizes = {}
         self.dlc_size_labels = {}
         
-        # Apply clean theme configuration
         self.setup_styles()
         self.create_widgets()
         
-        # Start automatic installation search asynchronously
         threading.Thread(target=self.async_detect_installations, daemon=True).start()
         
-        # Start queue checker
         self.root.after(100, self.process_queue)
 
     def setup_styles(self):
@@ -262,6 +259,22 @@ class X4UnpackerGUI:
             fg="#333333"
         )
         self.lbl_total_size.pack(side=tk.RIGHT, padx=10)
+
+        self.btn_toggle_all = ttk.Button(
+            self.dlc_bottom_bar,
+            text="Deselect All",
+            command=self.toggle_all_dlc,
+            width=12
+        )
+        self.btn_toggle_all.pack(side=tk.LEFT)
+
+        self.btn_ego_only = ttk.Button(
+            self.dlc_bottom_bar,
+            text="X4 DLC Only",
+            command=self.select_ego_dlc_only,
+            width=14
+        )
+        self.btn_ego_only.pack(side=tk.LEFT, padx=(5, 0))
         
         self.dlc_vars = {}
 
@@ -358,6 +371,10 @@ class X4UnpackerGUI:
         self.copy_content_var = tk.BooleanVar(value=True)
         self.cb_copy_content = ttk.Checkbutton(settings_group, text="Copy content.xml for selected DLCs/extensions", variable=self.copy_content_var)
         self.cb_copy_content.pack(anchor=tk.W, pady=(5, 0))
+
+        self.md5_verify_var = tk.BooleanVar(value=True)
+        self.cb_md5_verify = ttk.Checkbutton(settings_group, text="Verify MD5 file integrity", variable=self.md5_verify_var)
+        self.cb_md5_verify.pack(anchor=tk.W, pady=(5, 0))
 
         self.set_checkboxes_state(tk.DISABLED)
 
@@ -562,13 +579,29 @@ class X4UnpackerGUI:
                         pass
         return catalogs
 
+    def toggle_all_dlc(self):
+        """Toggles all content checkboxes between fully selected and fully deselected."""
+        all_selected = all(var.get() for var in self.dlc_vars.values())
+        new_state = not all_selected
+        for var in self.dlc_vars.values():
+            var.set(new_state)
+        self.btn_toggle_all.config(text="Deselect All" if new_state else "Select All")
+        self.recalculate_sizes()
+
+    def select_ego_dlc_only(self):
+        """Selects only ego_dlc_ extensions, deselecting Base Game and community mods."""
+        for identifier, var in self.dlc_vars.items():
+            folder = identifier.split("/")[-1]
+            var.set(folder.lower().startswith("ego_dlc_"))
+        self.recalculate_sizes()
+
     def recalculate_sizes(self):
         """Filters cached catalog metadata on the main thread and updates all size labels instantly."""
         pattern = self.ent_regex.get().strip()
         try:
             compiled_regex = re.compile(pattern, re.IGNORECASE)
         except Exception:
-            compiled_regex = re.compile(".*")  # Fallback to match everything on error
+            compiled_regex = re.compile(".*") 
 
         self.filtered_dlc_sizes = {}
         
@@ -588,6 +621,10 @@ class X4UnpackerGUI:
             if var.get():
                 total_bytes += self.filtered_dlc_sizes.get(identifier, 0)
         self.lbl_total_size.config(text=f"Content Selected Size: ~ {self.format_size(total_bytes)}")
+
+        if self.dlc_vars:
+            all_selected = all(var.get() for var in self.dlc_vars.values())
+            self.btn_toggle_all.config(text="Deselect All" if all_selected else "Select All")
 
     def update_dlc_selection(self, source_dir):
         """Scans source folder for basegame cat files and extensions, generating checkboxes dynamically."""
@@ -991,6 +1028,7 @@ class X4UnpackerGUI:
         self.spin_threads.config(state=tk.NORMAL)
         self.cb_overwrite.config(state=tk.NORMAL)
         self.cb_copy_content.config(state=tk.NORMAL)
+        self.cb_md5_verify.config(state=tk.NORMAL)
         self.set_dlc_checkboxes_state(tk.NORMAL)
         
         if self.filter_var.get() == 4:
@@ -998,7 +1036,7 @@ class X4UnpackerGUI:
         else:
             self.set_checkboxes_state(tk.DISABLED)
 
-    # Unpack core
+
     def start_extraction(self):
         if self.is_running:
             return
@@ -1051,13 +1089,14 @@ class X4UnpackerGUI:
         self.spin_threads.config(state=tk.DISABLED)
         self.cb_overwrite.config(state=tk.DISABLED)
         self.cb_copy_content.config(state=tk.DISABLED)
+        self.cb_md5_verify.config(state=tk.DISABLED)
         self.set_checkboxes_state(tk.DISABLED)
         self.set_dlc_checkboxes_state(tk.DISABLED)
         self.progress_bar["value"] = 0
 
         threading.Thread(
             target=self.run_unpacking_thread,
-            args=(source, dest, regex_filter, threads, self.overwrite_var.get(), self.copy_content_var.get(), filter_name, active_content),
+            args=(source, dest, regex_filter, threads, self.overwrite_var.get(), self.copy_content_var.get(), self.md5_verify_var.get(), filter_name, active_content),
             daemon=True
         ).start()
 
@@ -1065,7 +1104,7 @@ class X4UnpackerGUI:
         self.cancel_event.set()
         self.btn_start.config(state=tk.DISABLED, text="Cancelling...", bg="#CCCCCC", fg="#666666")
 
-    def run_unpacking_thread(self, source, dest, regex_filter, threads, force_overwrite, copy_content_xml, filter_name, active_content):
+    def run_unpacking_thread(self, source, dest, regex_filter, threads, force_overwrite, copy_content_xml, verify_md5_active, filter_name, active_content):
         self.queue.put(("log", "\nExtraction Starting..."))
         self.queue.put(("log", f"Filter Profile: {filter_name}"))
         self.queue.put(("log", f"Target Folder:  {dest}"))
@@ -1135,6 +1174,7 @@ class X4UnpackerGUI:
                             continue
 
                         size_str = parts[-3]
+                        expected_md5 = parts[-1]
                         fp = " ".join(parts[:-3]).replace('\\', '/').lower()
                         while fp.startswith('./'): fp = fp[2:]
                         while fp.startswith('/'): fp = fp[1:]
@@ -1158,7 +1198,8 @@ class X4UnpackerGUI:
                             'dat': dat_path,
                             'cat': cat_name,
                             'offset': cum_offset,
-                            'size': size
+                            'size': size,
+                            'md5': expected_md5
                         }
                         cum_offset += size
             except Exception as e:
@@ -1185,49 +1226,69 @@ class X4UnpackerGUI:
             return
 
         os.makedirs(dest, exist_ok=True)
-        jobs = [(fp, info, dest, force_overwrite, self.cancel_event) for fp, info in matched_files]
-        total_jobs = len(jobs)
+
+
+        from collections import defaultdict
+        grouped_jobs = defaultdict(list)
+        for fp, info in matched_files:
+            grouped_jobs[info['dat']].append((fp, info))
+
+        batch_size = 200
+        jobs = []
+        for dat_path, items in grouped_jobs.items():
+            for i in range(0, len(items), batch_size):
+                chunk = items[i:i + batch_size]
+                jobs.append((dat_path, chunk, dest, force_overwrite, verify_md5_active, self.cancel_event))
+
+        total_jobs = len(matched_files)
 
         self.queue.put(("progress_init", total_jobs))
         self.queue.put(("log", f"Extracting files using {threads} parallel worker processes..."))
 
         extracted = 0
         skipped = 0
+        md5_passed = 0
+        md5_failed = 0
         errors = 0
+        error_details = []
         cancelled = False
 
         extraction_start = time.perf_counter()
 
         with ThreadPoolExecutor(max_workers=threads) as executor:
-            futures = [executor.submit(self.extract_worker, job) for job in jobs]
+            futures = [executor.submit(self.batch_extract_worker, job) for job in jobs]
 
             for future in as_completed(futures):
                 if self.cancel_event.is_set():
                     cancelled = True
                     break
-                    
-                success, reason = future.result()
-                if success:
-                    extracted += 1
-                elif reason == "skipped":
-                    skipped += 1
-                elif reason == "cancelled":
-                    pass
-                else:
-                    errors += 1
+
+                batch_results = future.result()
+                for fp, success, status, details in batch_results:
+                    if success:
+                        extracted += 1
+                        if details == "md5_pass":
+                            md5_passed += 1
+                    else:
+                        if status == "skipped":
+                            skipped += 1
+                        elif status == "cancelled":
+                            pass
+                        elif status == "md5_fail":
+                            md5_failed += 1
+                            errors += 1
+                            error_details.append((fp, f"MD5 Integrity Mismatch ({details})"))
+                        else:
+                            errors += 1
+                            error_details.append((fp, f"IO Error ({details})"))
 
                 processed = extracted + skipped + errors
-                if processed % max(1, (total_jobs // 100)) == 0 or processed == total_jobs:
-                    elapsed = time.perf_counter() - extraction_start
-                    
-                    speed = processed / elapsed if elapsed > 0 else 0
-                    
-                    remaining_jobs = total_jobs - processed
-                    box_eta = remaining_jobs / speed if speed > 0 else 0
-                    
-                    pct = (processed / total_jobs) * 100
-                    
-                    self.queue.put(("progress_update", (processed, pct, speed, box_eta)))
+                elapsed = time.perf_counter() - extraction_start
+                speed = processed / elapsed if elapsed > 0 else 0
+                remaining_jobs = total_jobs - processed
+                box_eta = remaining_jobs / speed if speed > 0 else 0
+                pct = (processed / total_jobs) * 100
+                self.queue.put(("progress_update", (processed, pct, speed, box_eta)))
 
         if cancelled:
             self.queue.put(("log", "\nJob aborted by user."))
@@ -1260,34 +1321,72 @@ class X4UnpackerGUI:
 
         self.queue.put(("log", f"\nJob Completed in {time_str}."))
         self.queue.put(("log", f"Successful Extractions: {extracted}"))
+        
+        if verify_md5_active:
+            total_tested = md5_passed + md5_failed
+            self.queue.put(("log", f"MD5 Verification Checked: {total_tested} file(s)"))
+            self.queue.put(("log", f"MD5 Verification Passed:  {md5_passed}"))
+            self.queue.put(("log", f"MD5 Verification Failed:  {md5_failed}"))
+            
         self.queue.put(("log", f"Unchanged Files Skipped: {skipped}"))
-        self.queue.put(("log", f"Encountered Errors: {errors}"))
+        self.queue.put(("log", f"Encountered Errors:      {errors}"))
+
+        if len(error_details) > 0:
+            self.queue.put(("log", "\nDetailed Failure Logs:"))
+            for path, err in error_details[:50]:
+                self.queue.put(("log", f"  [FAIL] {path}: {err}"))
+            if len(error_details) > 50:
+                self.queue.put(("log", f"  ... and {len(error_details) - 50} more errors."))
 
         self.queue.put(("done", time_str))
 
     @staticmethod
-    def extract_worker(job):
-        fp, info, dest_dir, force, cancel_event = job
-        if cancel_event.is_set():
-            return False, "cancelled"
-            
-        size = info['size']
-        out_path = os.path.normpath(os.path.join(dest_dir, fp))
-
-        if os.path.exists(out_path) and not force:
-            return False, "skipped"
+    def batch_extract_worker(job):
+        """Worker that opens each .dat file once and processes all assigned files in a single pass."""
+        dat_path, items, dest_dir, force, verify_md5, cancel_event = job
+        results = []
 
         try:
-            os.makedirs(os.path.dirname(out_path), exist_ok=True)
-            with open(info['dat'], 'rb') as d_file:
-                d_file.seek(info['offset'])
-                data = d_file.read(size)
+            with open(dat_path, 'rb') as d_file:
+                for fp, info in items:
+                    if cancel_event.is_set():
+                        results.append((fp, False, "cancelled", None))
+                        continue
 
-            with open(out_path, 'wb') as out_file:
-                out_file.write(data)
-            return True, "success"
+                    size = info['size']
+                    expected_md5 = info.get('md5')
+                    out_path = os.path.normpath(os.path.join(dest_dir, fp))
+
+                    if os.path.exists(out_path) and not force:
+                        results.append((fp, False, "skipped", None))
+                        continue
+
+                    try:
+                        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                        d_file.seek(info['offset'])
+                        data = d_file.read(size)
+
+                        md5_status = "no_md5"
+                        if verify_md5 and expected_md5 and len(expected_md5) == 32:
+                            hasher = hashlib.md5()
+                            hasher.update(data)
+                            calculated_md5 = hasher.hexdigest()
+                            if calculated_md5.lower() != expected_md5.lower():
+                                results.append((fp, False, "md5_fail", f"calculated: {calculated_md5}, catalog: {expected_md5}"))
+                                continue
+                            md5_status = "md5_pass"
+
+                        with open(out_path, 'wb') as out_file:
+                            out_file.write(data)
+                        results.append((fp, True, "success", md5_status))
+                    except Exception as e:
+                        results.append((fp, False, "error", str(e)))
         except Exception as e:
-            return False, f"error: {e}"
+
+            for fp, info in items:
+                results.append((fp, False, "error", f"Failed to open source DAT: {str(e)}"))
+
+        return results
 
 
 if __name__ == '__main__':
