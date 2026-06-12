@@ -42,8 +42,8 @@ The wizard will:
   - Suggest a default output directory named "X4 unpacked " in the folder where
     the tool is running.
   - Provide selection filters: [1] Standard text files only (xml, xsd, lua, xpl,
-    txt) - Recommended [2] ALL files (models, sounds, textures, etc.) [3] Manual
-    entry using custom Regex patterns (e.g. ..xml|..lua)
+    txt) - Recommended [2] ALL files (models, sounds, textures, etc.) [3] ALL files -
+    No Sound (everything except wav, ogg, xwma) [4] Manual entry using custom Regex patterns
   - Configure the extraction thread count.
   - Prompt for skip or overwrite behavior for pre-existing files.
 
