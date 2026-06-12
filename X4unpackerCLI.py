@@ -1,7 +1,7 @@
 """
 X4 Foundations Cat/Dat Unpacker
 Combines interactive UI, Multithreading, and high-speed binary extraction.
-Now correctly separates Base Game and Extension/DLC files.
+Includes automatic MD5 file integrity verification and detailed statistics reporting.
 """
 
 import os
@@ -13,13 +13,17 @@ import hashlib
 import argparse
 import re
 import subprocess
+from collections import defaultdict
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
 if os.name == 'nt':
     os.system("")
+
 C_WHITE = "\033[97;40m"
 C_RED = "\033[91;40m"
 C_GREEN = "\033[92;40m"
+C_PURPLE = "\033[95;40m"
 C_RESET = "\033[0m"
 C_CLEAR_LINE = "\033[K"
 
@@ -101,6 +105,7 @@ def find_x4_installations():
         except Exception:
             pass
         return found
+
     with ThreadPoolExecutor(max_workers=2) as executor:
         f_defaults = executor.submit(check_defaults)
         f_registry = executor.submit(check_registry)
@@ -142,6 +147,7 @@ def interactive_wizard():
             
         if error_msg:
             print(f"{C_RED}[ERROR] {error_msg}{C_RESET}\n")
+
     clear_screen()
     draw_banner()
     print("Searching for X4 Installation Directories...\n")
@@ -239,9 +245,10 @@ def interactive_wizard():
         print("Select File Types to Unpack")
         print("[1] Standard text files only (xml, xsd, lua, xpl, txt) - Recommended")
         print("[2] ALL files (Models, sounds, textures, EVERYTHING - Takes massive space)")
-        print("[3] Manual Entry (Type your own Regex parameters)\n")
+        print("[3] ALL files - No Sound (Everything except wav, ogg, xwma)")
+        print("[4] Manual Entry (Type your own Regex parameters)\n")
         
-        choice = input("Select an option [1-3]: ").strip()
+        choice = input("Select an option [1-4]: ").strip()
         if choice == '1':
             regex_patterns = r".*\.xml|.*\.xsd|.*\.lua|.*\.xpl|.*\.txt"
             state['file_types'] = "Standard text files only"
@@ -251,6 +258,10 @@ def interactive_wizard():
             state['file_types'] = "ALL files"
             break
         elif choice == '3':
+            regex_patterns = r"^(?!.*\.(wav|ogg|xwma)$).*$"
+            state['file_types'] = "ALL files - No Sound"
+            break
+        elif choice == '4':
             print('\nExample: .*\\.xml|.*\\.lua')
             regex_patterns = input("Enter your custom Regex string: ").strip()
             if regex_patterns:
@@ -259,7 +270,8 @@ def interactive_wizard():
             else:
                 error = "Regex string cannot be empty."
         else:
-            error = "Please enter 1, 2, or 3."
+            error = "Please enter 1, 2, 3, or 4."
+
     max_system_threads = os.cpu_count() or 4
     error = None
     while True:
@@ -353,35 +365,72 @@ def log(msg):
     print(msg, file=sys.stderr)
 
 
-def extract_worker(job):
-    """ Worker function executed by thread pool """
-    fp, info, dest_dir, force = job
-    size = info['size']
-    out_path = os.path.normpath(os.path.join(dest_dir, fp))
-
-    if os.path.exists(out_path) and not force:
-        return (False, "skipped")
+def batch_extract_worker(job):
+    """ Worker function executed by thread pool with MD5 validation over a batch of files """
+    dat_path, items, dest_dir, force = job
+    results = []
 
     try:
-        os.makedirs(os.path.dirname(out_path), exist_ok=True)
-        with open(info['dat'], 'rb') as d_file:
-            d_file.seek(info['offset'])
-            data = d_file.read(size)
-            
-        with open(out_path, 'wb') as out_file:
-            out_file.write(data)
-        return (True, "success")
+        with open(dat_path, 'rb') as d_file:
+            for fp, info in items:
+                size = info['size']
+                expected_md5 = info.get('md5')
+                out_path = os.path.normpath(os.path.join(dest_dir, fp))
+
+                if os.path.exists(out_path) and not force:
+                    results.append((fp, False, "skipped", "File already exists"))
+                    continue
+
+                try:
+                    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                    d_file.seek(info['offset'])
+                    data = d_file.read(size)
+                    
+                    has_md5 = expected_md5 and len(expected_md5) == 32
+                    md5_status = "no_md5"
+                    
+                    if has_md5:
+                        hasher = hashlib.md5()
+                        hasher.update(data)
+                        calculated_md5 = hasher.hexdigest()
+                        if calculated_md5.lower() != expected_md5.lower():
+                            results.append((fp, False, "md5_fail", f"calculated: {calculated_md5}, catalog: {expected_md5}"))
+                            continue
+                        md5_status = "md5_pass"
+                        
+                    with open(out_path, 'wb') as out_file:
+                        out_file.write(data)
+                    results.append((fp, True, "extracted", md5_status))
+                except Exception as e:
+                    results.append((fp, False, "io_error", str(e)))
     except Exception as e:
-        return (False, f"error: {e}")
+        for fp, info in items:
+            results.append((fp, False, "io_error", f"Failed to open source DAT: {str(e)}"))
+
+    return results
 
 
-def print_progress(current, total, bar_length=40):
-    """ Draws the dynamic progress bar on a single line """
+def print_progress(current, total, bar_length=30, elapsed=0.0):
+    """ Draws the dynamic progress bar with speed and ETA on a single line """
     if total == 0: return
     pct = (current / total) * 100
     filled = int((pct * bar_length) / 100)
     bar = '#' * filled + '-' * (bar_length - filled)
-    sys.stdout.write(f"\r\033[1G[{bar}] {pct:.1f}% ({current}/{total} files extracted){C_CLEAR_LINE}")
+
+    color = C_GREEN if current == total else C_PURPLE
+
+    if current > 0 and elapsed > 0:
+        speed = current / elapsed
+        eta = (total - current) / speed
+        if eta > 60:
+            eta_str = f"{int(eta // 60)}m {int(eta % 60)}s"
+        else:
+            eta_str = f"{eta:.0f}s"
+        stats = f" | {speed:.1f} files/s | ETA: {eta_str}"
+    else:
+        stats = ""
+
+    sys.stdout.write(f"\r\033[1G{color}[{bar}] {pct:.1f}% ({current}/{total}){stats}{C_RESET}{C_CLEAR_LINE}")
     sys.stdout.flush()
 
 
@@ -439,7 +488,7 @@ def main():
         cum_offset = 0
         rel_dir = os.path.relpath(os.path.dirname(cat_path), base_install_dir).replace('\\', '/')
         if rel_dir == '.':
-            rel_dir = "" # Base game file, no prefix needed
+            rel_dir = "" 
             
         try:
             with open(cat_path, 'r', encoding='utf-8', errors='replace') as f:
@@ -450,6 +499,7 @@ def main():
                     if len(parts) < 4: continue
                     
                     size_str = parts[-3]
+                    expected_md5 = parts[-1]
                     fp = " ".join(parts[:-3]).replace('\\', '/').lower()
                     while fp.startswith('./'): fp = fp[2:]
                     while fp.startswith('/'): fp = fp[1:]
@@ -469,7 +519,8 @@ def main():
                         'dat': dat_path,
                         'cat': cat_name,
                         'offset': cum_offset,
-                        'size': size
+                        'size': size,
+                        'md5': expected_md5
                     }
                     cum_offset += size
         except Exception as e:
@@ -504,51 +555,99 @@ def main():
     if len(matched_files) == 0:
         log("Nothing to extract.")
         sys.exit(0)
+        
     if args.command == 'x':
         os.makedirs(args.dest_dir, exist_ok=True)
         
         extracted = 0
         skipped = 0
-        errors = 0
+        md5_passed = 0
+        md5_failed = 0
+        io_errors = 0
+        error_details = []
         
-        jobs = [(fp, info, args.dest_dir, args.force) for fp, info in matched_files]
-        total_jobs = len(jobs)
-        
-        print_progress(0, total_jobs)
+        grouped_jobs = defaultdict(list)
+        for fp, info in matched_files:
+            grouped_jobs[info['dat']].append((fp, info))
+            
+        batch_size = 200
+        jobs = []
+        for dat_path, items in grouped_jobs.items():
+            for i in range(0, len(items), batch_size):
+                chunk = items[i:i + batch_size]
+                jobs.append((dat_path, chunk, args.dest_dir, args.force))
+                
+        total_files = len(matched_files)
+        processed_files = 0
+        extraction_start = time.perf_counter()
+        print_progress(0, total_files)
         
         with ThreadPoolExecutor(max_workers=args.threads) as executor:
-            futures = [executor.submit(extract_worker, job) for job in jobs]
+            futures = [executor.submit(batch_extract_worker, job) for job in jobs]
             
             for future in as_completed(futures):
-                success, reason = future.result()
-                if success:
-                    extracted += 1
-                elif reason == "skipped":
-                    skipped += 1
-                else:
-                    errors += 1
+                batch_results = future.result()
+                for fp, success, status, details in batch_results:
+                    if success:
+                        extracted += 1
+                        if details == "md5_pass":
+                            md5_passed += 1
+                    else:
+                        if status == "skipped":
+                            skipped += 1
+                        elif status == "md5_fail":
+                            md5_failed += 1
+                            error_details.append((fp, f"MD5 Integrity Mismatch ({details})"))
+                        elif status == "io_error":
+                            io_errors += 1
+                            error_details.append((fp, f"IO Error ({details})"))
                 
-                processed = extracted + skipped + errors
-                if processed % max(1, (total_jobs // 100)) == 0 or processed == total_jobs:
-                    print_progress(processed, total_jobs)
+                processed_files += len(batch_results)
+                print_progress(processed_files, total_files, elapsed=time.perf_counter() - extraction_start)
 
         print("")
-        log(f"\n{C_GREEN}Extracted : {extracted}{C_RESET}")
-        if skipped > 0: log(f"Skipped   : {skipped} (already existed)")
-        if errors > 0: log(f"{C_RED}Errors    : {errors}{C_RESET}")
+        log(f"\n{C_RED}Extracted:{C_RESET} {extracted}")
+        if skipped > 0: 
+            log(f"{C_RED}Skipped:{C_RESET} {skipped} (already existed)")
+            
+        total_tested = md5_passed + md5_failed
+        log(f"{C_RED}MD5 Check:{C_RESET} {md5_passed}/{total_tested} completed successfully")
+        
+        if md5_failed > 0:
+            log(f"{C_RED}MD5 Fail:{C_RESET} {C_RED}{md5_failed} count failed{C_RESET}")
+        else:
+            log(f"{C_RED}MD5 Fail:{C_RESET} 0 count failed")
+            
+        if io_errors > 0:
+            log(f"{C_RED}IO Fail:{C_RESET} {C_RED}{io_errors} count failed (Write/Permission issues){C_RESET}")
+            
+        elapsed = time.perf_counter() - start_time
+        if elapsed > 60:
+            mins = int(elapsed // 60)
+            secs = elapsed % 60
+            log(f"{C_RED}Time Taken:{C_RESET} {mins}m {secs:.2f}s")
+        else:
+            log(f"{C_RED}Time Taken:{C_RESET} {elapsed:.2f} seconds")
+
+        if len(error_details) > 0:
+            log(f"\n{C_RED}List of Failures:{C_RESET}")
+            for path, err in error_details[:50]:
+                log(f"  {path}: {err}")
+            if len(error_details) > 50:
+                log(f"  ... and {len(error_details) - 50} more failures.")
 
     elif args.command == 'ls':
         for fp, info in matched_files:
             print(f"{info['size']:>12}  {info['cat']:<12}  {fp}")
         log(f"\nListed: {len(matched_files)}")
 
-    elapsed = time.perf_counter() - start_time
-    if elapsed > 60:
-        mins = int(elapsed // 60)
-        secs = elapsed % 60
-        log(f"Time taken: {mins}m {secs:.2f}s")
-    else:
-        log(f"Time taken: {elapsed:.2f} seconds")
+        elapsed = time.perf_counter() - start_time
+        if elapsed > 60:
+            mins = int(elapsed // 60)
+            secs = elapsed % 60
+            log(f"{C_RED}Time Taken:{C_RESET} {mins}m {secs:.2f}s")
+        else:
+            log(f"{C_RED}Time Taken:{C_RESET} {elapsed:.2f} seconds")
         
     if len(sys.argv) == 1:
         input("\nPress ENTER to exit...")
